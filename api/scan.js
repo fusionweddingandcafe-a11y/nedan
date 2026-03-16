@@ -14,7 +14,7 @@ export default async function handler(req, res) {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 300, system: SYSTEM, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } }, { type: 'text', text: 'この値札を解析。JSONのみ返答。' }] }] })
+      body: JSON.stringify({ model: 'claude-haiku-4-5',max_tokens: 300, system: SYSTEM, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } }, { type: 'text', text: 'この値札を解析。JSONのみ返答。' }] }] })
     });
     if (!r.ok) { const t = await r.text().catch(() => ''); return res.status(r.status).json({ error: r.status, detail: t.slice(0, 300) }); }
     const data = await r.json();
