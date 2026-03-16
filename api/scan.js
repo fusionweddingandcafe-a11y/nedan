@@ -6,33 +6,59 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not set' });
+  if (!apiKey) return res.status(500).json({ error: 'NO_API_KEY' });
 
-  // ★ Vercelサーバーレス関数でbodyを確実に読み取る
-  let body;
+  // ── ボディを確実に読み取る ──────────────────────
+  let image = null;
+  let debugInfo = {};
+
   try {
-    if (typeof req.body === 'string') {
-      body = JSON.parse(req.body);
-    } else if (req.body && typeof req.body === 'object') {
-      body = req.body;
+    // パターン1: Vercelが自動パース済み（オブジェクト）
+    if (req.body && typeof req.body === 'object' && req.body.image) {
+      image = req.body.image;
+      debugInfo.source = 'req.body.object';
+
+    // パターン2: 文字列として渡された
+    } else if (req.body && typeof req.body === 'string') {
+      const parsed = JSON.parse(req.body);
+      image = parsed.image;
+      debugInfo.source = 'req.body.string';
+
+    // パターン3: ストリームから直接読む
     } else {
-      // rawボディを直接読み取る
       const chunks = [];
-      for await (const chunk of req) chunks.push(chunk);
+      for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       const raw = Buffer.concat(chunks).toString('utf-8');
-      body = JSON.parse(raw);
+      debugInfo.rawLength = raw.length;
+      debugInfo.rawPreview = raw.slice(0, 50);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        image = parsed.image;
+        debugInfo.source = 'stream';
+      }
     }
   } catch (e) {
-    return res.status(400).json({ error: 'body parse failed: ' + e.message });
+    return res.status(400).json({ error: 'BODY_PARSE_ERROR', detail: e.message, debug: debugInfo });
   }
 
-  const image = body?.image;
-  if (!image) return res.status(400).json({ error: 'image field missing', bodyType: typeof req.body });
-  if (image.length > 3000000) return res.status(413).json({ error: 'image_too_large', size: image.length });
+  // 診断情報を返す
+  debugInfo.bodyType = typeof req.body;
+  debugInfo.hasBody = !!req.body;
+  debugInfo.hasImage = !!image;
+  debugInfo.imageLength = image ? image.length : 0;
+  debugInfo.contentType = req.headers['content-type'];
 
+  if (!image) {
+    return res.status(400).json({ error: 'NO_IMAGE', debug: debugInfo });
+  }
+
+  if (image.length > 3000000) {
+    return res.status(413).json({ error: 'TOO_LARGE', size: image.length });
+  }
+
+  // ── Anthropic API 呼び出し ──────────────────────
   const SYSTEM = `あなたは日本の小売店の値札読み取り専門AIです。JSONのみで返答してください。
-スーパー: 税込価格を採用。食品は8%軽減税率あり。ダイソー: 税込110/220/330/550円。無印良品: そのまま税込。ユニクロ/GU: 税込のみ。
-除外: 100g単価/重量g,kg,ml,L/JANコード13桁/賞味期限/カロリーkcal/バーコード8桁以上/%OFF単体。
+スーパー: 税込価格を採用。食品は8%軽減税率あり。ダイソー: 税込110/220/330/550円。
 税込/(税込)/内税→included。税抜/税別/+税→excluded。不明→unknown。
 {"price":<整数|null>,"tax_status":"included"|"excluded"|"unknown","tax_rate":10,"confidence":"high"|"medium"|"low","reasoning":"<30字>","ignored":[]}`;
 
@@ -57,7 +83,7 @@ export default async function handler(req, res) {
 
     if (!r.ok) {
       const t = await r.text().catch(() => '');
-      return res.status(r.status).json({ error: r.status, detail: t.slice(0, 300) });
+      return res.status(r.status).json({ error: 'ANTHROPIC_ERROR', status: r.status, detail: t.slice(0, 300) });
     }
 
     const data = await r.json();
@@ -67,9 +93,9 @@ export default async function handler(req, res) {
     catch {
       const m = clean.match(/\{[\s\S]*\}/);
       if (m) return res.status(200).json(JSON.parse(m[0]));
-      return res.status(500).json({ error: 'parse failed', raw: clean.slice(0, 200) });
+      return res.status(500).json({ error: 'PARSE_FAILED', raw: clean.slice(0, 200) });
     }
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: 'FETCH_ERROR', detail: e.message });
   }
 }
