@@ -5,12 +5,10 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.error('ERROR: ANTHROPIC_API_KEY is not set');
-    return res.status(500).json({ error: 'NO_API_KEY' });
-  }
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY not set' });
 
+  // ── ボディ読み取り ──────────────────────────────
   let body;
   try {
     if (req.body && typeof req.body === 'object') {
@@ -20,62 +18,77 @@ export default async function handler(req, res) {
     } else {
       const chunks = [];
       for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      const raw = Buffer.concat(chunks).toString('utf-8');
-      body = JSON.parse(raw);
+      body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
     }
   } catch (e) {
-    console.error('BODY_PARSE_ERROR:', e.message);
     return res.status(400).json({ error: 'body_parse_failed', detail: e.message });
   }
 
   const image = body?.image;
-  if (!image) {
-    console.error('NO_IMAGE: bodyType=', typeof req.body);
-    return res.status(400).json({ error: 'no_image', bodyType: typeof req.body });
-  }
-  if (image.length > 3000000) {
-    console.error('TOO_LARGE:', image.length);
-    return res.status(413).json({ error: 'too_large', size: image.length });
-  }
+  if (!image) return res.status(400).json({ error: 'image missing' });
+  if (image.length > 3000000) return res.status(413).json({ error: 'too_large', size: image.length });
 
-  console.log('Calling Anthropic API, image size:', image.length, 'apiKey prefix:', apiKey.slice(0,10));
+  const PROMPT = `あなたは日本の小売店の値札読み取り専門AIです。
 
-  const SYSTEM = `あなたは日本の小売店の値札読み取り専門AIです。JSONのみで返答してください。
-スーパー: 税込価格を採用。食品は8%軽減税率あり。ダイソー: 税込110/220/330/550円。無印良品: そのまま税込。ユニクロ/GU: 税込のみ。
-除外: 100g単価/重量g,kg,ml,L/JANコード13桁/賞味期限/カロリーkcal/バーコード8桁以上/%OFF単体。
-税込/(税込)/内税→included。税抜/税別/+税→excluded。不明→unknown。
-{"price":<整数|null>,"tax_status":"included"|"excluded"|"unknown","tax_rate":10,"confidence":"high"|"medium"|"low","reasoning":"<30字>","ignored":[]}`;
+【店舗別パターン】
+スーパー(イオン/西友/ライフ等): 大きな数字が税抜、小さく「税込○○○円」→税込採用。食品は軽減税率8%あり。
+ダイソー: 100円(税込110円)/200円(税込220円)/300円(税込330円)/500円(税込550円)→税込採用。
+セリア: 均一110円(税込)→110円。
+無印良品: 990円等→税込のみ表示、そのまま採用。
+ユニクロ/GU: ¥1990等→2021年以降は税込のみ。
+書籍: 定価1320円(本体1200円+税)→1320円(税込)採用。
+
+【除外する数字】
+/100g・100gあたり・@100g・/kg近く→単価除外。
+数字直後にg/kg/ml/L→重量除外。
+13桁前後の連続数字→JAN除外。
+賞味期限日付→除外。kcal/cal近く→カロリー除外。
+8桁以上連続→バーコード除外。
+
+【税区分判定】
+「税込」「(税込)」「内税」「総額」→included
+「税抜」「税別」「本体価格」「+税」「+消費税」→excluded
+不明→unknown
+
+JSONのみで返答（説明文不要）:
+{"price":<整数|null>,"tax_status":"included"|"excluded"|"unknown","tax_rate":10,"confidence":"high"|"medium"|"low","reasoning":"<30字以内>","ignored":[{"value":<数値>,"reason":"<理由>"}]}`;
 
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
+    // Google Gemini 2.0 Flash API
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+    const r = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 300,
-        system: SYSTEM,
-        messages: [{ role: 'user', content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image } },
-          { type: 'text', text: 'この値札を解析。JSONのみ返答。' }
-        ]}]
+        contents: [{
+          parts: [
+            {
+              inline_data: {
+                mime_type: 'image/jpeg',
+                data: image
+              }
+            },
+            { text: PROMPT }
+          ]
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 300
+        }
       })
     });
 
-    const responseText = await r.text();
-    console.log('Anthropic status:', r.status, 'response:', responseText.slice(0, 300));
-
     if (!r.ok) {
-      console.error('ANTHROPIC_ERROR:', r.status, responseText.slice(0, 300));
-      return res.status(r.status).json({ error: 'anthropic_error', status: r.status, detail: responseText.slice(0, 300) });
+      const t = await r.text().catch(() => '');
+      console.error('Gemini error:', r.status, t.slice(0, 300));
+      return res.status(r.status).json({ error: 'gemini_error', status: r.status, detail: t.slice(0, 300) });
     }
 
-    const data = JSON.parse(responseText);
-    const txt = data.content?.find(c => c.type === 'text')?.text || '{}';
+    const data = await r.json();
+    const txt = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
     const clean = txt.replace(/```json|```/g, '').trim();
+
     try { return res.status(200).json(JSON.parse(clean)); }
     catch {
       const m = clean.match(/\{[\s\S]*\}/);
@@ -83,7 +96,7 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'parse_failed', raw: clean.slice(0, 200) });
     }
   } catch (e) {
-    console.error('FETCH_ERROR:', e.message);
+    console.error('Fetch error:', e.message);
     return res.status(500).json({ error: 'fetch_error', detail: e.message });
   }
 }
